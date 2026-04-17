@@ -1,6 +1,6 @@
 """
-PAT.ai 
-Hackathon Edition (PS 3)
+PAT.ai - Enterprise Data Resolution Engine
+Hackathon Edition (PS 3 & PS 1)
 """
 
 from typing import Optional, Dict, Any, List
@@ -103,6 +103,19 @@ def load_model():
     except ImportError:
         return None, "fallback"
 
+@st.cache_resource(show_spinner=False)
+def load_catboost_model():
+    """Loads the Stage-2 Re-ranking CatBoost Model if it exists."""
+    if os.path.exists("catboost_duplicate_model.cbm"):
+        try:
+            from catboost import CatBoostClassifier
+            cb = CatBoostClassifier()
+            cb.load_model("catboost_duplicate_model.cbm")
+            return cb
+        except Exception as e:
+            print(f"Failed to load CatBoost: {e}")
+    return None
+
 CACHE_FILE = "embeddings_cache.npy"
 HASH_FILE  = "embeddings_hash.txt"
 
@@ -128,11 +141,15 @@ def get_embeddings(texts: List[str], model, model_type: str, df: pd.DataFrame = 
             f.write(get_dataset_hash(df))
     return embeddings
 
-# ---------------------- HACKATHON INNOVATION: FAISS Engine ----------------------
+# ---------------------- TWO-STAGE PIPELINE: FAISS + CATBOOST ----------------------
 def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, model, model_type: str) -> pd.DataFrame:
     texts = df[text_col].astype(str).tolist()
+    cb_model = load_catboost_model()
+    
+    # Check if we have the complex metadata to run Stage 2 CatBoost
+    has_complex_metadata = all(col in df.columns for col in ['category', 'region', 'created_at', 'name'])
 
-    with st.spinner(" Generating multilingual embeddings..."):
+    with st.spinner("🧠 Generating multilingual embeddings..."):
         embeddings = get_embeddings(texts, model, model_type, df=df)
 
     with st.spinner("⚡ Indexing with FAISS for scalable search..."):
@@ -149,42 +166,89 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
     seen = set()
     n = len(df)
     
+    if cb_model and has_complex_metadata:
+        st.toast("🧠 AI OS is using the Stage-2 CatBoost Re-ranker!", icon="🚀")
+    
     for i in range(n):
         for rank, j in enumerate(indices[i]):
             if i == j: continue
             score = float(distances[i][rank])
             
-            if score >= base_threshold:
-                row_i, row_j = df.iloc[i], df.iloc[j]
-                lang_i = str(row_i.get('language', '')).strip()
-                lang_j = str(row_j.get('language', '')).strip()
-                
-                # Dynamic Thresholding: Stricter for same-language to prevent sentiment errors
-                dynamic_threshold = 0.92 if lang_i == lang_j else 0.85
-                
-                if score >= dynamic_threshold:
+            # --- STAGE 2 CATBOOST LOGIC ---
+            if cb_model and has_complex_metadata:
+                # Cast a wide net (0.80) and let CatBoost decide the truth
+                if score >= 0.80:
                     pair_key = tuple(sorted((i, int(j))))
                     if pair_key not in seen:
                         seen.add(pair_key)
                         
-                        pairs.append({
-                            'Record A ID': row_i.get('id', i),
-                            'Record A Text': row_i[text_col],
-                            'Language A': lang_i,
-                            'Record B ID': row_j.get('id', j),
-                            'Record B Text': row_j[text_col],
-                            'Language B': lang_j,
-                            'Similarity': round(score * 100, 1),
-                            'Cross-Language': lang_i != lang_j,
-                            'Target_Column': text_col 
-                        })
+                        row_i, row_j = df.iloc[i], df.iloc[j]
+                        
+                        # Build the exact features we trained on
+                        name_fuzz = fuzz.ratio(str(row_i.get('name', '')), str(row_j.get('name', ''))) / 100.0
+                        cat_A = str(row_i.get('category', 'Unknown'))
+                        cat_B = str(row_j.get('category', 'Unknown'))
+                        region_A = str(row_i.get('region', 'Unknown'))
+                        region_B = str(row_j.get('region', 'Unknown'))
+                        
+                        try:
+                            if pd.notnull(row_i.get('created_at')) and pd.notnull(row_j.get('created_at')):
+                                t1 = pd.to_datetime(row_i['created_at'])
+                                t2 = pd.to_datetime(row_j['created_at'])
+                                time_diff = abs((t1 - t2).total_seconds()) / 3600.0
+                            else: time_diff = 9999.0
+                        except: time_diff = 9999.0
+                        
+                        features = [score, name_fuzz, cat_A, cat_B, region_A, region_B, time_diff]
+                        
+                        # XGBoost/CatBoost makes the final decision
+                        prediction = cb_model.predict([features])[0]
+                        
+                        if prediction == 1:
+                            lang_i = str(row_i.get('language', '')).strip()
+                            lang_j = str(row_j.get('language', '')).strip()
+                            pairs.append({
+                                'Record A ID': row_i.get('id', i),
+                                'Record A Text': row_i[text_col],
+                                'Language A': lang_i,
+                                'Record B ID': row_j.get('id', j),
+                                'Record B Text': row_j[text_col],
+                                'Language B': lang_j,
+                                'Similarity': round(score * 100, 1),
+                                'Cross-Language': lang_i != lang_j,
+                                'Target_Column': text_col 
+                            })
+
+            # --- FALLBACK LOGIC (Simple Dataset) ---
+            else:
+                if score >= base_threshold:
+                    row_i, row_j = df.iloc[i], df.iloc[j]
+                    lang_i = str(row_i.get('language', '')).strip()
+                    lang_j = str(row_j.get('language', '')).strip()
+                    
+                    dynamic_threshold = 0.92 if lang_i == lang_j else 0.85
+                    if score >= dynamic_threshold:
+                        pair_key = tuple(sorted((i, int(j))))
+                        if pair_key not in seen:
+                            seen.add(pair_key)
+                            pairs.append({
+                                'Record A ID': row_i.get('id', i),
+                                'Record A Text': row_i[text_col],
+                                'Language A': lang_i,
+                                'Record B ID': row_j.get('id', j),
+                                'Record B Text': row_j[text_col],
+                                'Language B': lang_j,
+                                'Similarity': round(score * 100, 1),
+                                'Cross-Language': lang_i != lang_j,
+                                'Target_Column': text_col 
+                            })
 
     result_df = pd.DataFrame(pairs)
     if not result_df.empty:
         result_df = result_df.sort_values('Similarity', ascending=False).reset_index(drop=True)
     return result_df
 
-# ---------------------- Merge Logic ----------------------
+# ---------------------- AI Merge Logic ----------------------
 def generate_new_record(text_a, lang_a, text_b, lang_b):
     primary_text = text_a if lang_a.lower() == 'english' else text_b
     secondary_text = text_b if lang_a.lower() == 'english' else text_a
@@ -195,7 +259,7 @@ def generate_new_record(text_a, lang_a, text_b, lang_b):
         "Primary_Name": primary_text,
         "Primary_Language": "English",
         "Regional_Aliases": {secondary_lang: secondary_text},
-        "Resolution_Status": "Merged Confirmed "
+        "Resolution_Status": "Merged Confirmed ✅"
     }
 
 # ---------------------- Core Action Handler ----------------------
@@ -206,7 +270,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
     try: 
         if action == "duplicate":
             text_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
-            blocked_cols = ['id', 'language', 'group_id', 'group', 'unnamed: 0']
+            blocked_cols = ['id', 'language', 'group_id', 'group', 'unnamed: 0', 'user_id', 'created_at']
             text_cols = [c for c in text_cols if c.lower() not in blocked_cols]
             
             if not text_cols: return [{"type": "text", "content": "No valid text columns found."}]
@@ -218,10 +282,10 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
             dup_df = detect_duplicates(df, target_col, 0.85, model, model_type)
             
             if dup_df.empty:
-                return [{"type": "text", "content": f" No semantic duplicates found in column `{target_col}`."}]
+                return [{"type": "text", "content": f"✅ No semantic duplicates found in column `{target_col}`."}]
             else:
                 return [
-                    {"type": "text", "content": f" Found **{len(dup_df)}** duplicate pairs. Sending to Resolution Dashboard..."},
+                    {"type": "text", "content": f"⚠️ Found **{len(dup_df)}** duplicate pairs. Sending to Resolution Dashboard..."},
                     {"type": "resolution_dashboard", "content": dup_df}
                 ]
                 
@@ -232,7 +296,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
         if action == "hello": 
             return [{"type": "text", "content": "Heyy!! How can I help you today? Upload a dataset and click the buttons to start the action!"}]
         
-        # --- ACTIONS ---
+        # --- RESTORED ACTIONS ---
         if action in ("structure", "rows"): return [{"type": "text", "content": f"The dataset has **{df.shape[0]} rows**."}]
         if action in ("structure", "columns"): return [{"type": "text", "content": f"The dataset has **{df.shape[1]} columns**."}]
         if action == "describe": return [{"type": "table", "content": df.describe(include='all').T}]
@@ -260,7 +324,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
                     if (z > 3).sum() > 0: outlier_info[c] = int((z > 3).sum())
 
             if missing.empty and dup_count == 0 and not outlier_info:
-                return [{"type": "text", "content": " Overall Data Quality is, No missing values, or outliers found."}]
+                return [{"type": "text", "content": "✅ Data Quality is excellent. No missing values, duplicates, or outliers found."}]
             else:
                 return [{"type": "data_quality", "content": {"missing": missing.to_dict(), "duplicates": dup_count, "outliers": outlier_info}}]
                 
@@ -268,7 +332,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
             num_rows, num_cols = df.shape
             missing_cells = df.isnull().sum().sum()
             dup_rows = df.duplicated().sum()
-            insight_text = f"** Key Insights Overview:**\n\n* **Size:** The database contains {num_rows} records and {num_cols} attributes.\n* **Completeness:** There are {missing_cells} missing data points in total.\n* **Exact Duplicates:** Found {dup_rows} exact (non-semantic) duplicate rows.\n* **Actionable Next Step:** Use the 'Find duplicates' tool to run a semantic AI scan on the text columns."
+            insight_text = f"**📊 Key Insights Overview:**\n\n* **Size:** The database contains {num_rows} records and {num_cols} attributes.\n* **Completeness:** There are {missing_cells} missing data points in total.\n* **Exact Duplicates:** Found {dup_rows} exact (non-semantic) duplicate rows.\n* **Actionable Next Step:** Use the 'Find duplicates' tool to run a semantic AI scan on the text columns."
             return [{"type": "text", "content": insight_text}]
             
         if action in ("histogram", "bar", "line", "scatter", "heatmap", "pie"):
@@ -281,7 +345,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
 
             elif action == "pie":
                 cat_cols = df.select_dtypes(exclude=[np.number]).columns
-                blocked_cols = ['id', 'text', 'description']
+                blocked_cols = ['id', 'text', 'description', 'name']
                 cat_cols = [c for c in cat_cols if c.lower() not in blocked_cols]
                 
                 if len(cat_cols) > 0:
@@ -369,13 +433,12 @@ with st.sidebar:
             st.success(f'Loaded {uploaded.name} — {st.session_state["df"].shape[0]} rows, {st.session_state["df"].shape[1]} cols')
         
     st.markdown("---")
-    st.caption('Cognitive Coders')
+    st.caption('Hackathon Edition')
 
 # ---------------------- LANDING PAGE ----------------------
 if not st.session_state["chat_started"]:
     st.markdown("""
-<style>
-    /* --- BASE/DARK MODE STYLES --- */
+    <style>
     .landing-wrapper { position: fixed; top: 34%; left: 50%; transform: translate(-50%, -50%); width: 100%; text-align: center; z-index: 1000; pointer-events: none; }
     .landing-greeting, .landing-sub { font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 2.2rem; font-weight: 600; color: #ffffff !important; line-height: 1.3; margin: 0; text-shadow: 0 2px 10px rgba(0,0,0,0.4); }
     .landing-sub { margin-top: 0.5rem; font-size: 1.2rem; color: #d1d5db !important;}
@@ -387,52 +450,18 @@ if not st.session_state["chat_started"]:
     div[data-testid="stChatInput"] div[data-baseweb="textarea"], div[data-testid="stChatInput"] div[data-baseweb="textarea"] > div { background: transparent !important; border: none !important; }
     div[data-testid="stChatInput"] textarea { font-size: 16px !important; color: white !important; padding: 0 !important; min-height: 60px !important; background: transparent !important; line-height: 1.5 !important; }
     button[data-testid="stChatSendButton"] { position: absolute !important; bottom: 16px !important; right: 16px !important; background: transparent !important; color: white !important; z-index: 10; }
-    div[data-testid="stChatInput"]::before { content: "✨ v1.0"; position: absolute; bottom: 16px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
+    div[data-testid="stChatInput"]::before { content: "✨ PAT.ai Daemon Active"; position: absolute; bottom: 16px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
     [data-testid="stHorizontalBlock"] { position: fixed !important; top: 66% !important; left: 50% !important; transform: translateX(-50%) !important; display: flex !important; justify-content: center !important; flex-wrap: wrap !important; width: 100% !important; max-width: 900px !important; gap: 10px !important; z-index: 1005 !important; }
     [data-testid="stHorizontalBlock"] > div { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; }
     div[data-testid="stHorizontalBlock"] button { background: rgba(36, 42, 60, 0.7) !important; border: none !important; border-radius: 999px !important; padding: 10px 20px !important; font-size: 13.5px !important; font-weight: 500 !important; color: #e5e7eb !important; box-shadow: none !important; transition: background 0.2s ease !important; }
     div[data-testid="stHorizontalBlock"] button:hover { background: rgba(255, 255, 255, 0.15) !important; }
-
-    /* --- LIGHT MODE OVERRIDES --- */
-    @media (prefers-color-scheme: light) {
-        .landing-greeting { color: #0f172a !important; text-shadow: none !important; }
-        .landing-sub { color: #475569 !important; text-shadow: none !important; }
-        
-        div[data-testid="stChatInput"] { 
-            background: rgba(255, 255, 255, 0.95) !important; 
-            border: 1px solid rgba(0, 0, 0, 0.1) !important; 
-            box-shadow: 0 8px 32px rgba(0,0,0,0.08) !important; 
-        }
-        div[data-testid="stChatInput"]:focus-within { 
-            border: 1px solid rgba(0, 0, 0, 0.2) !important; 
-            box-shadow: 0 12px 40px rgba(0,0,0,0.12) !important; 
-        }
-        div[data-testid="stChatInput"] textarea { color: #0f172a !important; }
-        button[data-testid="stChatSendButton"] { color: #0f172a !important; }
-        
-        div[data-testid="stChatInput"]::before { 
-            background: rgba(0, 0, 0, 0.05) !important; 
-            color: #475569 !important; 
-        }
-        
-        div[data-testid="stHorizontalBlock"] button { 
-            background: rgba(255, 255, 255, 0.85) !important; 
-            color: #0f172a !important; 
-            border: 1px solid rgba(0,0,0,0.1) !important; 
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05) !important;
-        }
-        div[data-testid="stHorizontalBlock"] button:hover { 
-            background: rgba(241, 245, 249, 1) !important; 
-            border: 1px solid rgba(0,0,0,0.15) !important;
-        }
-    }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown("""
         <div class='landing-wrapper'>
-            <div class='landing-greeting'>Good afternoon, mate</div>
-            <div class='landing-sub'>What can I help you with today?</div>
+            <div class='landing-greeting'>PAT.ai Operating System</div>
+            <div class='landing-sub'>Intelligent Data Resolution & Analytics</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -458,8 +487,7 @@ if not st.session_state["chat_started"]:
 # ---------------------- ACTIVE CHAT ----------------------
 else:
     st.markdown("""
-<style>
-    /* --- BASE/DARK MODE STYLES --- */
+    <style>
     [data-testid="stBottom"] { background: transparent !important; }
     [data-testid="stBottom"] > div { max-width: 840px !important; margin: 0 auto !important; background: transparent !important; padding-bottom: 24px !important; }
     div[data-testid="stChatInput"] { background: rgba(30, 36, 51, 0.95) !important; border: 1px solid rgba(255, 255, 255, 0.08) !important; border-radius: 24px !important; min-height: 100px !important; width: 100% !important; box-shadow: 0 8px 32px rgba(0,0,0,0.3) !important; position: relative !important; padding: 0 !important; }
@@ -468,7 +496,7 @@ else:
     div[data-testid="stChatInput"] div[data-baseweb="textarea"], div[data-testid="stChatInput"] div[data-baseweb="textarea"] > div { background: transparent !important; border: none !important; }
     div[data-testid="stChatInput"] textarea { font-size: 16px !important; color: white !important; padding: 0 !important; min-height: 40px !important; background: transparent !important; line-height: 1.5 !important; }
     button[data-testid="stChatSendButton"] { position: absolute !important; bottom: 12px !important; right: 16px !important; background: transparent !important; color: white !important; z-index: 10; }
-    div[data-testid="stChatInput"]::before { content: "✨ v1.0"; position: absolute; bottom: 12px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
+    div[data-testid="stChatInput"]::before { content: "✨ PAT.ai Daemon Active"; position: absolute; bottom: 12px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
     .stChatMessage { background: transparent !important; border: none !important; box-shadow: none !important; padding: 12px 0 !important; backdrop-filter: none !important; }
     .stChatMessage[data-testid="stChatMessage-assistant"] { background: transparent !important; }
     .stChatMessage[data-testid="stChatMessage-user"] { background: rgba(255, 255, 255, 0.05) !important; border-radius: 16px !important; padding: 12px 20px !important; width: fit-content !important; max-width: 80% !important; margin-left: auto !important; flex-direction: row-reverse !important; }
@@ -479,43 +507,6 @@ else:
     [data-testid="stHorizontalBlock"] > div { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; }
     div[data-testid="stHorizontalBlock"] button { background: rgba(36, 42, 60, 0.7) !important; border: none !important; border-radius: 999px !important; padding: 8px 16px !important; font-size: 13px !important; font-weight: 500 !important; color: #e5e7eb !important; transition: background 0.2s ease !important; }
     div[data-testid="stHorizontalBlock"] button:hover { background: rgba(255, 255, 255, 0.15) !important; }
-
-    /* --- LIGHT MODE OVERRIDES --- */
-    @media (prefers-color-scheme: light) {
-        /* Chat Input Box */
-        div[data-testid="stChatInput"] { 
-            background: rgba(255, 255, 255, 0.95) !important; 
-            border: 1px solid rgba(0, 0, 0, 0.1) !important; 
-            box-shadow: 0 8px 32px rgba(0,0,0,0.08) !important; 
-        }
-        div[data-testid="stChatInput"]:focus-within { 
-            border: 1px solid rgba(0, 0, 0, 0.2) !important; 
-        }
-        div[data-testid="stChatInput"] textarea { color: #0f172a !important; }
-        button[data-testid="stChatSendButton"] { color: #0f172a !important; }
-        div[data-testid="stChatInput"]::before { 
-            background: rgba(0, 0, 0, 0.05) !important; 
-            color: #475569 !important; 
-        }
-        
-        /* Chat Bubbles */
-        .stChatMessage[data-testid="stChatMessage-user"] { 
-            background: rgba(0, 0, 0, 0.04) !important; 
-        }
-        .stChatMessage[data-testid="stChatMessage-user"] * { color: #0f172a !important; }
-        .stChatMessage[data-testid="stChatMessage-assistant"] * { color: #0f172a !important; }
-
-        /* Suggestion Chips */
-        div[data-testid="stHorizontalBlock"] button { 
-            background: rgba(255, 255, 255, 0.85) !important; 
-            color: #0f172a !important; 
-            border: 1px solid rgba(0,0,0,0.1) !important; 
-        }
-        div[data-testid="stHorizontalBlock"] button:hover { 
-            background: rgba(241, 245, 249, 1) !important; 
-            border: 1px solid rgba(0,0,0,0.15) !important;
-        }
-    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -534,11 +525,11 @@ else:
                 
                 # --- CHAT-BASED DOWNLOAD BUTTON ---
                 elif msg['type'] == 'download':
-                    st.markdown("###  Export Cleaned Master Data")
+                    st.markdown("### 💾 Export Cleaned Master Data")
                     st.caption("Here is your updated dataset.")
                     csv_data = st.session_state['df'].to_csv(index=False).encode('utf-8')
                     st.download_button(
-                        label=" Download Cleaned CSV",
+                        label="📥 Download Cleaned CSV",
                         data=csv_data,
                         file_name="cleaned_master_database.csv",
                         mime="text/csv",
@@ -550,9 +541,9 @@ else:
                 elif msg['type'] == 'data_quality':
                     issues = msg['content']
                     st.markdown("### 🧹 Data Quality Report")
-                    if issues.get("missing"): st.markdown(f" Missing values: {issues['missing']}")
-                    if issues.get("duplicates", 0) > 0: st.markdown(f" Found {issues['duplicates']} identical rows")
-                    if issues.get("outliers"): st.markdown(f" Outliers detected: {list(issues['outliers'].keys())}")
+                    if issues.get("missing"): st.markdown(f"⚠️ Missing values: {issues['missing']}")
+                    if issues.get("duplicates", 0) > 0: st.markdown(f"⚠️ Found {issues['duplicates']} identical rows")
+                    if issues.get("outliers"): st.markdown(f"⚠️ Outliers detected: {list(issues['outliers'].keys())}")
                 
                 # --- STATE-AWARE RESOLUTION DASHBOARD ---
                 elif msg['type'] == 'resolution_dashboard':
@@ -565,7 +556,7 @@ else:
                         merge_key = f"merged_{row['Record A ID']}_{row['Record B ID']}"
                         
                         if merge_key not in st.session_state:
-                            with st.expander(f" {row['Record A Text']} | {row['Record B Text']} (Match: {row['Similarity']}%)"):
+                            with st.expander(f"⚠️ {row['Record A Text']} | {row['Record B Text']} (Match: {row['Similarity']}%)"):
                                 col1, col2, col3 = st.columns([2, 2, 1])
                                 
                                 with col1: st.info(f"**Record A ({row['Language A']})**\n\nID: {row['Record A ID']}\n\n{row['Record A Text']}")
@@ -599,7 +590,7 @@ else:
                                             st.session_state['has_merged'] = True
                                             st.rerun()
                         else:
-                            st.success(f"Successfully Merged Records {row['Record A ID']} & {row['Record B ID']} into a New Record!")
+                            st.success(f"✅ Successfully Merged Records {row['Record A ID']} & {row['Record B ID']} into a New Record!")
 
     # --- SUGGESTION CHIPS (ACTIVE CHAT) ---
     valid_remaining = [q for q in st.session_state["remaining_queries"] if q in predefined_queries]
