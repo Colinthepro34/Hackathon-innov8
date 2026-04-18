@@ -1,6 +1,6 @@
 """
-PAT.ai - Enterprise Data Resolution Engine
-Hackathon Edition (PS 3 & PS 1)
+PAT.ai 
+Hackathon (PS 3)
 """
 
 from typing import Optional, Dict, Any, List
@@ -21,7 +21,7 @@ from rapidfuzz import fuzz
 
 warnings.filterwarnings('ignore')
 
-# ---------------------- Helper: Background Images ----------------------
+# ---------------------- Background Images ----------------------
 def get_base64(path):
     try:
         with open(path, "rb") as f:
@@ -145,14 +145,12 @@ def get_embeddings(texts: List[str], model, model_type: str, df: pd.DataFrame = 
 def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, model, model_type: str) -> pd.DataFrame:
     texts = df[text_col].astype(str).tolist()
     cb_model = load_catboost_model()
-    
-    # Check if we have the complex metadata to run Stage 2 CatBoost
     has_complex_metadata = all(col in df.columns for col in ['category', 'region', 'created_at', 'name'])
 
-    with st.spinner("🧠 Generating multilingual embeddings..."):
+    with st.spinner(" Generating multilingual embeddings..."):
         embeddings = get_embeddings(texts, model, model_type, df=df)
 
-    with st.spinner("⚡ Indexing with FAISS for scalable search..."):
+    with st.spinner(" Indexing with FAISS for scalable search..."):
         embeddings_np = np.array(embeddings).astype('float32')
         faiss.normalize_L2(embeddings_np)
         
@@ -167,7 +165,7 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
     n = len(df)
     
     if cb_model and has_complex_metadata:
-        st.toast("🧠 AI OS is using the Stage-2 CatBoost Re-ranker!", icon="🚀")
+        st.toast(" PAT is using the Stage-2 CatBoost Re-ranker!", icon="🚀")
     
     for i in range(n):
         for rank, j in enumerate(indices[i]):
@@ -176,7 +174,6 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
             
             # --- STAGE 2 CATBOOST LOGIC ---
             if cb_model and has_complex_metadata:
-                # Cast a wide net (0.80) and let CatBoost decide the truth
                 if score >= 0.80:
                     pair_key = tuple(sorted((i, int(j))))
                     if pair_key not in seen:
@@ -201,7 +198,7 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
                         
                         features = [score, name_fuzz, cat_A, cat_B, region_A, region_B, time_diff]
                         
-                        # XGBoost/CatBoost makes the final decision
+                        # CatBoost final decision
                         prediction = cb_model.predict([features])[0]
                         
                         if prediction == 1:
@@ -219,7 +216,7 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
                                 'Target_Column': text_col 
                             })
 
-            # --- FALLBACK LOGIC (Simple Dataset) ---
+            # --- FALLBACK LOGIC ---
             else:
                 if score >= base_threshold:
                     row_i, row_j = df.iloc[i], df.iloc[j]
@@ -248,7 +245,7 @@ def detect_duplicates(df: pd.DataFrame, text_col: str, base_threshold: float, mo
         result_df = result_df.sort_values('Similarity', ascending=False).reset_index(drop=True)
     return result_df
 
-# ---------------------- AI Merge Logic ----------------------
+# ---------------------- Merge Logic ----------------------
 def generate_new_record(text_a, lang_a, text_b, lang_b):
     primary_text = text_a if lang_a.lower() == 'english' else text_b
     secondary_text = text_b if lang_a.lower() == 'english' else text_a
@@ -259,10 +256,10 @@ def generate_new_record(text_a, lang_a, text_b, lang_b):
         "Primary_Name": primary_text,
         "Primary_Language": "English",
         "Regional_Aliases": {secondary_lang: secondary_text},
-        "Resolution_Status": "Merged Confirmed ✅"
+        "Resolution_Status": "Merged Confirmed "
     }
 
-# ---------------------- Core Action Handler ----------------------
+# ---------------------- Action Handler ----------------------
 def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     if df is None: return [{"type": "text", "content": "No dataset loaded. Please upload a CSV or Excel file first."}]
     if cols is None: cols = extract_column_names(text, df)
@@ -282,7 +279,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
             dup_df = detect_duplicates(df, target_col, 0.85, model, model_type)
             
             if dup_df.empty:
-                return [{"type": "text", "content": f"✅ No semantic duplicates found in column `{target_col}`."}]
+                return [{"type": "text", "content": f" No semantic duplicates found in column `{target_col}`."}]
             else:
                 return [
                     {"type": "text", "content": f"⚠️ Found **{len(dup_df)}** duplicate pairs. Sending to Resolution Dashboard..."},
@@ -324,7 +321,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
                     if (z > 3).sum() > 0: outlier_info[c] = int((z > 3).sum())
 
             if missing.empty and dup_count == 0 and not outlier_info:
-                return [{"type": "text", "content": "✅ Data Quality is excellent. No missing values, duplicates, or outliers found."}]
+                return [{"type": "text", "content": " Data Quality is excellent. No missing values, duplicates, or outliers found."}]
             else:
                 return [{"type": "data_quality", "content": {"missing": missing.to_dict(), "duplicates": dup_count, "outliers": outlier_info}}]
                 
@@ -332,7 +329,7 @@ def run_action(action: str, text: str, df: pd.DataFrame, cols: Optional[List[str
             num_rows, num_cols = df.shape
             missing_cells = df.isnull().sum().sum()
             dup_rows = df.duplicated().sum()
-            insight_text = f"**📊 Key Insights Overview:**\n\n* **Size:** The database contains {num_rows} records and {num_cols} attributes.\n* **Completeness:** There are {missing_cells} missing data points in total.\n* **Exact Duplicates:** Found {dup_rows} exact (non-semantic) duplicate rows.\n* **Actionable Next Step:** Use the 'Find duplicates' tool to run a semantic AI scan on the text columns."
+            insight_text = f"** Key Insights Overview:**\n\n* **Size:** The database contains {num_rows} records and {num_cols} attributes.\n* **Completeness:** There are {missing_cells} missing data points in total.\n* **Exact Duplicates:** Found {dup_rows} exact (non-semantic) duplicate rows.\n* **Actionable Next Step:** Use the 'Find duplicates' tool to run a semantic AI scan on the text columns."
             return [{"type": "text", "content": insight_text}]
             
         if action in ("histogram", "bar", "line", "scatter", "heatmap", "pie"):
@@ -368,8 +365,8 @@ def run_actions(actions: List[str], text: str, df: pd.DataFrame) -> List[Dict[st
         except Exception as e: all_results.append({"type": "text", "content": f"Error in {action}: {e}"})
     return all_results
 
-# ---------------------- Streamlit UI Setup ----------------------
-st.set_page_config(page_title='PAT.ai OS', layout='wide')
+# ---------------------- Streamlit UI ----------------------
+st.set_page_config(page_title='PAT', layout='wide')
 
 if "remaining_queries" not in st.session_state: st.session_state["remaining_queries"] = [1, 2, 3]
 if "max_query_idx" not in st.session_state: st.session_state["max_query_idx"] = 3
@@ -412,9 +409,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header('PAT.ai OS')
-    st.caption('Enterprise Master Data Management')
-    st.header('📂 Upload Database')
+    st.header('PAT.ai')
+    st.header(' Upload Database')
     uploaded = st.file_uploader('Upload CSV or Excel', type=['csv', 'xlsx', 'xls'])
     
     if uploaded is not None:
@@ -433,7 +429,7 @@ with st.sidebar:
             st.success(f'Loaded {uploaded.name} — {st.session_state["df"].shape[0]} rows, {st.session_state["df"].shape[1]} cols')
         
     st.markdown("---")
-    st.caption('Hackathon Edition')
+    st.caption('Cognitive Coders')
 
 # ---------------------- LANDING PAGE ----------------------
 if not st.session_state["chat_started"]:
@@ -450,7 +446,7 @@ if not st.session_state["chat_started"]:
     div[data-testid="stChatInput"] div[data-baseweb="textarea"], div[data-testid="stChatInput"] div[data-baseweb="textarea"] > div { background: transparent !important; border: none !important; }
     div[data-testid="stChatInput"] textarea { font-size: 16px !important; color: white !important; padding: 0 !important; min-height: 60px !important; background: transparent !important; line-height: 1.5 !important; }
     button[data-testid="stChatSendButton"] { position: absolute !important; bottom: 16px !important; right: 16px !important; background: transparent !important; color: white !important; z-index: 10; }
-    div[data-testid="stChatInput"]::before { content: "✨ PAT.ai Daemon Active"; position: absolute; bottom: 16px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
+    div[data-testid="stChatInput"]::before { content: "✨ v1.0"; position: absolute; bottom: 16px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
     [data-testid="stHorizontalBlock"] { position: fixed !important; top: 66% !important; left: 50% !important; transform: translateX(-50%) !important; display: flex !important; justify-content: center !important; flex-wrap: wrap !important; width: 100% !important; max-width: 900px !important; gap: 10px !important; z-index: 1005 !important; }
     [data-testid="stHorizontalBlock"] > div { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; }
     div[data-testid="stHorizontalBlock"] button { background: rgba(36, 42, 60, 0.7) !important; border: none !important; border-radius: 999px !important; padding: 10px 20px !important; font-size: 13.5px !important; font-weight: 500 !important; color: #e5e7eb !important; box-shadow: none !important; transition: background 0.2s ease !important; }
@@ -460,8 +456,8 @@ if not st.session_state["chat_started"]:
 
     st.markdown("""
         <div class='landing-wrapper'>
-            <div class='landing-greeting'>PAT.ai Operating System</div>
-            <div class='landing-sub'>Intelligent Data Resolution & Analytics</div>
+            <div class='landing-greeting'>Good Day, mate</div>
+            <div class='landing-sub'>What can I help you with today?</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -496,7 +492,7 @@ else:
     div[data-testid="stChatInput"] div[data-baseweb="textarea"], div[data-testid="stChatInput"] div[data-baseweb="textarea"] > div { background: transparent !important; border: none !important; }
     div[data-testid="stChatInput"] textarea { font-size: 16px !important; color: white !important; padding: 0 !important; min-height: 40px !important; background: transparent !important; line-height: 1.5 !important; }
     button[data-testid="stChatSendButton"] { position: absolute !important; bottom: 12px !important; right: 16px !important; background: transparent !important; color: white !important; z-index: 10; }
-    div[data-testid="stChatInput"]::before { content: "✨ PAT.ai Daemon Active"; position: absolute; bottom: 12px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
+    div[data-testid="stChatInput"]::before { content: "✨ v1.0"; position: absolute; bottom: 12px; left: 20px; background: rgba(255,255,255,0.06); padding: 6px 14px; border-radius: 12px; font-size: 13px; font-weight: 500; color: #d1d5db; pointer-events: none; z-index: 10; }
     .stChatMessage { background: transparent !important; border: none !important; box-shadow: none !important; padding: 12px 0 !important; backdrop-filter: none !important; }
     .stChatMessage[data-testid="stChatMessage-assistant"] { background: transparent !important; }
     .stChatMessage[data-testid="stChatMessage-user"] { background: rgba(255, 255, 255, 0.05) !important; border-radius: 16px !important; padding: 12px 20px !important; width: fit-content !important; max-width: 80% !important; margin-left: auto !important; flex-direction: row-reverse !important; }
@@ -525,11 +521,11 @@ else:
                 
                 # --- CHAT-BASED DOWNLOAD BUTTON ---
                 elif msg['type'] == 'download':
-                    st.markdown("### 💾 Export Cleaned Master Data")
+                    st.markdown("###  Export Cleaned Master Data")
                     st.caption("Here is your updated dataset.")
                     csv_data = st.session_state['df'].to_csv(index=False).encode('utf-8')
                     st.download_button(
-                        label="📥 Download Cleaned CSV",
+                        label=" Download Cleaned CSV",
                         data=csv_data,
                         file_name="cleaned_master_database.csv",
                         mime="text/csv",
@@ -540,7 +536,7 @@ else:
                 # --- DATA QUALITY REPORT ---
                 elif msg['type'] == 'data_quality':
                     issues = msg['content']
-                    st.markdown("### 🧹 Data Quality Report")
+                    st.markdown("###  Data Quality Report")
                     if issues.get("missing"): st.markdown(f"⚠️ Missing values: {issues['missing']}")
                     if issues.get("duplicates", 0) > 0: st.markdown(f"⚠️ Found {issues['duplicates']} identical rows")
                     if issues.get("outliers"): st.markdown(f"⚠️ Outliers detected: {list(issues['outliers'].keys())}")
@@ -548,7 +544,7 @@ else:
                 # --- STATE-AWARE RESOLUTION DASHBOARD ---
                 elif msg['type'] == 'resolution_dashboard':
                     duplicate_df = msg['content']
-                    st.markdown("### 🛠️ Intelligent Data Resolution Engine")
+                    st.markdown("### Intelligent Data Resolution Engine")
                     st.caption("Review FAISS semantic duplicates and merge them into a single New Record.")
                     
                     for index, row in duplicate_df.iterrows():
@@ -590,9 +586,9 @@ else:
                                             st.session_state['has_merged'] = True
                                             st.rerun()
                         else:
-                            st.success(f"✅ Successfully Merged Records {row['Record A ID']} & {row['Record B ID']} into a New Record!")
+                            st.success(f"Successfully Merged Records {row['Record A ID']} & {row['Record B ID']} into a New Record!")
 
-    # --- SUGGESTION CHIPS (ACTIVE CHAT) ---
+    # --- SUGGESTION CHIPS ---
     valid_remaining = [q for q in st.session_state["remaining_queries"] if q in predefined_queries]
     st.session_state["remaining_queries"] = valid_remaining
 
@@ -615,7 +611,7 @@ else:
                 st.rerun()
 
 # User Chat Input
-user_input = st.chat_input("Ask PAT.ai to analyze or clean data...")
+user_input = st.chat_input("Ask PAT to analyze...")
 if user_input:
     st.session_state["chat_started"] = True
     st.session_state["chat_history"].append({"role": "user", "content": user_input})
